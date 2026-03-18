@@ -50,6 +50,43 @@ EXCLUDED_TITLE_TOKENS = {
     "ЗАБРОНИРОВАТЬ",
 }
 
+# Дополнительные отели: название, URL или шаблон, кнопка для клика (если нужна).
+# url_template: для подстановки дат используйте {dfrom} и {dto} в формате ДД-ММ-ГГГГ.
+HOTEL_SOURCES = [
+    {
+        "name": "Олимпийская",
+        "type": "multi_page",
+        "urls": [
+            "https://olympik-hotel.ru/?view=page&id=2",
+            "https://olympik-hotel.ru/?view=page&id=14",
+            "https://olympik-hotel.ru/?view=page&id=7",
+            "https://olympik-hotel.ru/?view=page&id=18",
+        ],
+    },
+    {
+        "name": "Freezone inn",
+        "type": "button",
+        "url": "https://www.freezone.net/hotel/",
+        "button": "найти номер",
+    },
+    {
+        "name": "Постоялый двор Русь",
+        "type": "direct",
+        "url": "https://booking-russ.otelms.com/booking/rooms",
+    },
+    {
+        "name": "Чехов API",
+        "type": "date_button",
+        "url_template": "https://chekhov-api.tilda.ws/booking?dfrom={dfrom}&dto={dto}&adults=1&padding=12&lang=ru&uid=53b6c90b-227a-48cf-8339-c85954fab29e",
+        "button": "подобрать номер",
+    },
+    {
+        "name": "Чеховский мини-отель",
+        "type": "direct",
+        "url": "https://hotelchehov.ru/",
+    },
+]
+
 
 def human_sleep(a: float = 1.0, b: float = 2.2) -> None:
     """Случайная задержка для уменьшения нагрузки и для стабильности."""
@@ -68,6 +105,11 @@ def format_for_picker(d: date) -> str:
 def format_for_booking_url(d: date) -> str:
     """Формат дат в URL бронирования: ДД.ММ.ГГГГ."""
     return d.strftime("%d.%m.%Y")
+
+
+def format_date_dd_mm_yyyy(d: date) -> str:
+    """Формат ДД-ММ-ГГГГ для URL (например Чехов API)."""
+    return d.strftime("%d-%m-%Y")
 
 
 def to_int_rub(text: str) -> Optional[int]:
@@ -158,6 +200,69 @@ def click_check_availability_and_wait_prices(driver: webdriver.Chrome, timeout_s
     # Ждем загрузки: даем время на запрос и отрисовку цен
     human_sleep(2.5, 5.0)
     return True
+
+
+def click_button_by_text(driver: webdriver.Chrome, button_text: str, wait_after_s: float = 2.5) -> bool:
+    """
+    Универсальный клик по кнопке/ссылке с заданным текстом (частичное совпадение).
+    """
+    if not button_text or not button_text.strip():
+        return False
+    t = button_text.strip().replace("'", " ")
+    for xpath in [
+        f"//a[contains(., '{t[:50]}')]",
+        f"//button[contains(., '{t[:50]}')]",
+        f"//*[@type='submit'][contains(@value, '{t[:30]}')]",
+        f"//*[contains(., '{t[:30]}')]",
+    ]:
+        try:
+            els = driver.find_elements(By.XPATH, xpath)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    try:
+                        el.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", el)
+                    human_sleep(wait_after_s, wait_after_s + 1.5)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def scrape_prices_generic(driver: webdriver.Chrome) -> list:
+    """
+    Универсальный сбор категорий и цен со страницы (та же логика, что у Meridian).
+    Возвращает список {"category_name": str, "price": int}.
+    """
+    return scrape_prices_from_booking_page(driver)
+
+
+def scrape_one_category_per_page(driver: webdriver.Chrome) -> Optional[dict]:
+    """
+    Одна страница — одна категория (например Олимпийская: каждая ссылка id=2,14,7,18 — отдельная категория).
+    Извлекаем название (h1/h2) и цену (руб).
+    """
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text or ""
+    except NoSuchElementException:
+        return None
+    price = to_int_rub(body)
+    if price is None:
+        return None
+    name = None
+    for sel in ["h1", "h2", "h3"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            t = (el.text or "").strip()
+            if t and len(t) > 2 and t.upper() not in EXCLUDED_TITLE_TOKENS:
+                name = t
+                break
+        except NoSuchElementException:
+            continue
+    if not name:
+        name = "Номер"
+    return {"category_name": name, "price": price}
 
 
 def extract_room_name_from_block_text(block_text: str) -> Optional[str]:
@@ -618,6 +723,7 @@ def main() -> None:
                     rows.append(
                         {
                             "Дата": date_in.strftime("%Y-%m-%d"),
+                            "Отель": "Отель Меридиан",
                             "Категория номера": item["category_name"],
                             "Стоимость (руб)": item["price"],
                             "Примечание": "",
@@ -625,7 +731,6 @@ def main() -> None:
                     )
             else:
                 # Если не смогли вытащить цены (например, техработы/блокировка) — fallback:
-                # заполняем базовыми ценами со страниц отеля.
                 print(
                     "ВНИМАНИЕ: не удалось извлечь цены со страницы бронирования. "
                     "Будут использованы базовые цены со страниц категорий отеля."
@@ -634,6 +739,7 @@ def main() -> None:
                     rows.append(
                         {
                             "Дата": date_in.strftime("%Y-%m-%d"),
+                            "Отель": "Отель Меридиан",
                             "Категория номера": cat["category_name"],
                             "Стоимость (руб)": cat["base_price"],
                             "Примечание": "* (цена базовая, требуется уточнение). Уточнить: "
@@ -645,8 +751,93 @@ def main() -> None:
 
             human_sleep(1.0, 2.0)
 
-        df = pd.DataFrame(rows, columns=["Дата", "Категория номера", "Стоимость (руб)", "Примечание"])
-        out_name = f"prices_meridian_{START_DATE}_{END_DATE}.xlsx"
+        # Дополнительные отели из HOTEL_SOURCES
+        for hotel in HOTEL_SOURCES:
+            hotel_name = hotel["name"]
+            date_in = None
+            date_out = None
+            for d in dates:
+                date_in = d
+                date_out = d + timedelta(days=1)
+                if hotel["type"] == "multi_page":
+                    for page_url in hotel["urls"]:
+                        print(f"\n[{hotel_name}] {date_in} -> {page_url}")
+                        driver.get(page_url)
+                        human_sleep(1.2, 2.5)
+                        one = scrape_one_category_per_page(driver)
+                        if one:
+                            rows.append(
+                                {
+                                    "Дата": date_in.strftime("%Y-%m-%d"),
+                                    "Отель": hotel_name,
+                                    "Категория номера": one["category_name"],
+                                    "Стоимость (руб)": one["price"],
+                                    "Примечание": "",
+                                }
+                            )
+                        human_sleep(0.8, 1.5)
+                elif hotel["type"] == "date_button":
+                    dfrom = format_date_dd_mm_yyyy(date_in)
+                    dto = format_date_dd_mm_yyyy(date_out)
+                    url = hotel["url_template"].format(dfrom=dfrom, dto=dto)
+                    print(f"\n[{hotel_name}] {date_in} -> {url[:80]}...")
+                    driver.get(url)
+                    human_sleep(1.5, 2.5)
+                    if hotel.get("button") and not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
+                        print(f"  Кнопка «{hotel['button']}» не найдена.")
+                    scraped = scrape_prices_generic(driver)
+                    for item in scraped:
+                        rows.append(
+                            {
+                                "Дата": date_in.strftime("%Y-%m-%d"),
+                                "Отель": hotel_name,
+                                "Категория номера": item["category_name"],
+                                "Стоимость (руб)": item["price"],
+                                "Примечание": "",
+                            }
+                        )
+                    human_sleep(1.0, 2.0)
+                elif hotel["type"] == "button":
+                    print(f"\n[{hotel_name}] {date_in} -> {hotel['url']}")
+                    driver.get(hotel["url"])
+                    human_sleep(1.5, 2.5)
+                    if not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
+                        print(f"  Кнопка «{hotel['button']}» не найдена.")
+                    scraped = scrape_prices_generic(driver)
+                    for item in scraped:
+                        rows.append(
+                            {
+                                "Дата": date_in.strftime("%Y-%m-%d"),
+                                "Отель": hotel_name,
+                                "Категория номера": item["category_name"],
+                                "Стоимость (руб)": item["price"],
+                                "Примечание": "",
+                            }
+                        )
+                    human_sleep(1.0, 2.0)
+                else:
+                    # direct
+                    print(f"\n[{hotel_name}] {date_in} -> {hotel['url']}")
+                    driver.get(hotel["url"])
+                    human_sleep(1.5, 2.5)
+                    scraped = scrape_prices_generic(driver)
+                    for item in scraped:
+                        rows.append(
+                            {
+                                "Дата": date_in.strftime("%Y-%m-%d"),
+                                "Отель": hotel_name,
+                                "Категория номера": item["category_name"],
+                                "Стоимость (руб)": item["price"],
+                                "Примечание": "",
+                            }
+                        )
+                    human_sleep(1.0, 2.0)
+
+        df = pd.DataFrame(
+            rows,
+            columns=["Дата", "Отель", "Категория номера", "Стоимость (руб)", "Примечание"],
+        )
+        out_name = f"prices_all_{START_DATE}_{END_DATE}.xlsx"
         out_path = out_name  # сохраняем в текущую папку запуска/репозиторий Cursor
         # pandas для .xlsx требует openpyxl (если не указан другой engine)
         try:
