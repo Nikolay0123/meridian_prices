@@ -121,6 +121,45 @@ def wait_booking_page_ready(driver: webdriver.Chrome, timeout_s: int = 30) -> No
     human_sleep(1.5, 2.7)
 
 
+def click_check_availability_and_wait_prices(driver: webdriver.Chrome, timeout_s: int = 25) -> bool:
+    """
+    На странице бронирования цены появляются только после клика «Проверить наличие».
+    Ищем кнопку/ссылку с таким текстом, кликаем и ждем появления цен.
+    """
+    btn = None
+    # XPath: элемент (a, button, input, span, div), в тексте которого есть "проверить" и "наличие"
+    for xpath in [
+        "//a[contains(., 'проверить') and contains(., 'наличие')]",
+        "//button[contains(., 'проверить') or contains(., 'наличие')]",
+        "//*[@type='submit'][contains(@value, 'наличие') or contains(@value, 'проверить')]",
+        "//a[contains(., 'наличие')]",
+        "//button[contains(., 'наличие')]",
+        "//*[contains(., 'Проверить наличие')]",
+    ]:
+        try:
+            els = driver.find_elements(By.XPATH, xpath)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    btn = el
+                    break
+            if btn:
+                break
+        except NoSuchElementException:
+            continue
+    if not btn:
+        return False
+
+    try:
+        human_sleep(0.5, 1.0)
+        btn.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", btn)
+
+    # Ждем загрузки: даем время на запрос и отрисовку цен
+    human_sleep(2.5, 5.0)
+    return True
+
+
 def extract_room_name_from_block_text(block_text: str) -> Optional[str]:
     """
     Пытаемся вытащить название категории из текста блока:
@@ -567,6 +606,10 @@ def main() -> None:
             print(f"\nОткрываю бронирование: {url}")
             driver.get(url)
             wait_booking_page_ready(driver, timeout_s=35)
+
+            # Цены появляются только после клика «Проверить наличие»
+            if not click_check_availability_and_wait_prices(driver, timeout_s=25):
+                print("Кнопка «Проверить наличие» не найдена, пробуем парсить без клика.")
 
             scraped = scrape_prices_from_booking_page(driver)
 
