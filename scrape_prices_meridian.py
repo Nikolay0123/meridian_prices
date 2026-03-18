@@ -26,6 +26,8 @@ PHONE_1 = "+7 (916) 643-72-15"
 PHONE_2 = "+7 (925) 337-72-07"
 
 BASE_URL = "https://hotel-meridian.com/"
+BOOKING_BASE_URL = "https://meridian.bookonline24.ru/"
+ADULTS_COUNT = 1  # adultsCount в URL бронирования
 
 # Список страниц категорий, которые вы указали.
 # Именно с них извлекаем базовые цены для fallback-режима.
@@ -63,6 +65,11 @@ def format_for_picker(d: date) -> str:
     return d.strftime("%d.%m.%Y")
 
 
+def format_for_booking_url(d: date) -> str:
+    """Формат дат в URL бронирования: ДД.ММ.ГГГГ."""
+    return d.strftime("%d.%m.%Y")
+
+
 def to_int_rub(text: str) -> Optional[int]:
     """
     Пытаемся извлечь число в рублях.
@@ -89,6 +96,135 @@ def to_int_rub(text: str) -> Optional[int]:
         val = float(int_part + dec_part.replace(",", "."))
         return int(round(val))
     return int(int_part)
+
+
+def booking_url(from_date: date, to_date: date, adults_count: int = ADULTS_COUNT) -> str:
+    """
+    Генерируем URL бронирования, где выбираются даты и показываются цены по всем категориям.
+    Пример: https://meridian.bookonline24.ru/?fromDate=22.03.2026&toDate=23.03.2026&adultsCount=1
+    """
+    fd = format_for_booking_url(from_date)
+    td = format_for_booking_url(to_date)
+    return f"{BOOKING_BASE_URL}?fromDate={fd}&toDate={td}&adultsCount={adults_count}"
+
+
+def wait_booking_page_ready(driver: webdriver.Chrome, timeout_s: int = 30) -> None:
+    """
+    Ждем, пока страница бронирования отрисуется.
+    Если попали на страницу техработ, это не упадет сразу — дальше парсер вернет пусто,
+    и мы уйдем в fallback.
+    """
+    wait = WebDriverWait(driver, timeout_s)
+    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+    # Даем странице шанс дорисовать динамику.
+    human_sleep(1.5, 2.7)
+
+
+def extract_room_name_from_block_text(block_text: str) -> Optional[str]:
+    """
+    Пытаемся вытащить название категории из текста блока:
+    берем первую "осмысленную" строку без служебных слов.
+    """
+    if not block_text:
+        return None
+
+    lines = [ln.strip() for ln in block_text.splitlines() if ln.strip()]
+    for ln in lines[:15]:
+        upper = ln.upper()
+        if upper in EXCLUDED_TITLE_TOKENS:
+            continue
+        if "ЗАЕЗД" in upper or "ВЫЕЗД" in upper or "КОЛИЧЕСТВО" in upper:
+            continue
+        if "РУБ" in upper or "₽" in ln:
+            continue
+        # отсечем слишком короткое
+        if len(ln) < 3:
+            continue
+        return ln
+    return None
+
+
+def scrape_prices_from_booking_page(driver: webdriver.Chrome) -> list:
+    """
+    Собираем цены по всем категориям со страницы meridian.bookonline24.ru.
+
+    Так как разметка может быть динамической/меняться, используем устойчивую эвристику:
+    - находим "листовые" элементы, содержащие руб/₽
+    - для каждого элемента поднимаемся к ближайшему контейнеру и извлекаем из него название
+    - дедуплицируем по названию, берем первую найденную цену
+    """
+    # Быстрый признак техработ (на случай, если страница реально не отдает контент)
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        if "updating our service" in body_text.lower():
+            return []
+    except NoSuchElementException:
+        return []
+
+    # Ищем элементы с ценой (листовые, чтобы отсечь крупные контейнеры)
+    price_els = driver.find_elements(
+        By.XPATH,
+        "//*[not(*) and (contains(translate(., 'РУБЛЕЙРУБ', 'рублейруб'), 'руб') or contains(., '₽'))]",
+    )
+
+    results = {}
+    for el in price_els:
+        txt = (el.text or "").strip()
+        price = to_int_rub(txt)
+        if price is None:
+            continue
+
+        # Поднимаемся к контейнеру (ограничим глубину, чтобы не схватить всю страницу)
+        block = None
+        try:
+            block = el.find_element(By.XPATH, "./ancestor::*[self::div or self::li or self::section][1]")
+        except NoSuchElementException:
+            block = None
+
+        block_text = ""
+        if block is not None:
+            block_text = (block.text or "").strip()
+        else:
+            # fallback: используем текст родителя
+            try:
+                parent = el.find_element(By.XPATH, "./parent::*")
+                block_text = (parent.text or "").strip()
+            except NoSuchElementException:
+                block_text = txt
+
+        # Пытаемся найти "заголовок" внутри контейнера
+        name = None
+        if block is not None:
+            for sel in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+                hs = block.find_elements(By.CSS_SELECTOR, sel)
+                for h in hs:
+                    ht = (h.text or "").strip()
+                    if not ht:
+                        continue
+                    hu = ht.upper()
+                    if hu in EXCLUDED_TITLE_TOKENS:
+                        continue
+                    if "ЗАЕЗД" in hu or "ВЫЕЗД" in hu or "КОЛИЧЕСТВО" in hu:
+                        continue
+                    name = ht
+                    break
+                if name:
+                    break
+
+        if not name:
+            name = extract_room_name_from_block_text(block_text)
+
+        if not name:
+            continue
+
+        # Дедуп по названию: берем первую (обычно минимальная/основная цена)
+        if name not in results:
+            results[name] = price
+
+    # Превращаем в список
+    out = [{"category_name": k, "price": v} for k, v in results.items()]
+    return out
 
 
 def extract_category_title(body_text: str) -> Optional[str]:
@@ -421,62 +557,50 @@ def main() -> None:
 
         rows = []
 
-        # Если точные цены не извлекаются для категории, мы пометим это в примечаниях.
-        exact_supported = {}
+        # Основной источник теперь — единая страница бронирования, где есть все категории.
+        # Для каждой даты (1 ночь) собираем список категорий/цен и пишем в таблицу.
+        for d in dates:
+            date_in = d
+            date_out = d + timedelta(days=1)  # 1 ночь
 
-        for cat in categories:
-            cat_name = cat["category_name"]
-            cat_url = cat["category_url"]
-            base_price = cat["base_price"]
-            if not base_price:
-                continue
+            url = booking_url(date_in, date_out, adults_count=ADULTS_COUNT)
+            print(f"\nОткрываю бронирование: {url}")
+            driver.get(url)
+            wait_booking_page_ready(driver, timeout_s=35)
 
-            print(f"Категория: {cat_name} | базовая цена: {base_price} руб")
+            scraped = scrape_prices_from_booking_page(driver)
 
-            for d in dates:
-                date_in = d
-                date_out = d + timedelta(days=1)  # 1 ночь
-
-                exact_price = None
-                if exact_supported.get(cat_name, True):
-                    try:
-                        exact_price = open_booking_new_tab_and_parse_price(
-                            driver=driver,
-                            category_url=cat_url,
-                            date_in=date_in,
-                            date_out=date_out,
-                            guests=1,
-                        )
-                    except (TimeoutException, NoSuchElementException, Exception) as e:
-                        # Любая нештатная ситуация считаем "точные цены не достались"
-                        # и падаем в fallback.
-                        exact_price = None
-
-                note = ""
-                cost = base_price
-
-                if exact_price is not None:
-                    cost = exact_price
-                else:
-                    # В fallback-режиме добавляем ТЗ-пометку и телефоны.
-                    note = "* (цена базовая, требуется уточнение). Уточнить: " + PHONE_1 + "; " + PHONE_2
-                    exact_supported[cat_name] = False
-                    print(
-                        f"ВНИМАНИЕ: точные цены не удалось извлечь для категории '{cat_name}' на {date_in}. "
-                        f"Подставлена базовая цена {base_price} руб."
+            if scraped:
+                for item in scraped:
+                    rows.append(
+                        {
+                            "Дата": date_in.strftime("%Y-%m-%d"),
+                            "Категория номера": item["category_name"],
+                            "Стоимость (руб)": item["price"],
+                            "Примечание": "",
+                        }
                     )
-                    # Даем немного времени, чтобы пользователь в видимом Chrome мог заметить что происходит.
-
-                rows.append(
-                    {
-                        "Дата": date_in.strftime("%Y-%m-%d"),
-                        "Категория номера": cat_name,
-                        "Стоимость (руб)": cost,
-                        "Примечание": note,
-                    }
+            else:
+                # Если не смогли вытащить цены (например, техработы/блокировка) — fallback:
+                # заполняем базовыми ценами со страниц отеля.
+                print(
+                    "ВНИМАНИЕ: не удалось извлечь цены со страницы бронирования. "
+                    "Будут использованы базовые цены со страниц категорий отеля."
                 )
+                for cat in categories:
+                    rows.append(
+                        {
+                            "Дата": date_in.strftime("%Y-%m-%d"),
+                            "Категория номера": cat["category_name"],
+                            "Стоимость (руб)": cat["base_price"],
+                            "Примечание": "* (цена базовая, требуется уточнение). Уточнить: "
+                            + PHONE_1
+                            + "; "
+                            + PHONE_2,
+                        }
+                    )
 
-                human_sleep(0.8, 1.6)
+            human_sleep(1.0, 2.0)
 
         df = pd.DataFrame(rows, columns=["Дата", "Категория номера", "Стоимость (руб)", "Примечание"])
         out_name = f"prices_meridian_{START_DATE}_{END_DATE}.xlsx"
