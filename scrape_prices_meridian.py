@@ -38,6 +38,16 @@ CATEGORY_PAGES = [
     "https://hotel-meridian.com/nomera/standart-komfort-uluchshennyy-plyus/",
 ]
 
+# На странице виджета бронирования встречаются заголовки типа "ЗАЕЗД"/"ВЫЕЗД".
+# Они не являются категориями номеров, поэтому исключаем их при попытках
+# извлечь название категории.
+EXCLUDED_TITLE_TOKENS = {
+    "ЗАЕЗД",
+    "ВЫЕЗД",
+    "КОЛИЧЕСТВО ГОСТЕЙ",
+    "ЗАБРОНИРОВАТЬ",
+}
+
 
 def human_sleep(a: float = 1.0, b: float = 2.2) -> None:
     """Случайная задержка для уменьшения нагрузки и для стабильности."""
@@ -89,6 +99,48 @@ def extract_category_title(body_text: str) -> Optional[str]:
     m = re.search(r'Номер первой категории\s*[\"“](.*?)[\"”]', body_text)
     if m:
         return m.group(1).strip()
+    return None
+
+
+def get_category_title_from_dom(driver: webdriver.Chrome) -> Optional[str]:
+    """
+    Надежно достаем название категории из DOM.
+
+    Используем ключевую фразу "Номер первой категории ..." и избегаем
+    попадания в заголовки виджета типа "ЗАЕЗД".
+    """
+    # 1) Ищем элемент, который содержит ключевую фразу.
+    try:
+        el = driver.find_element(By.XPATH, "//*[contains(normalize-space(.), 'Номер первой категории')]")
+        t = (el.text or "").strip()
+        if t:
+            # Варианты кавычек: "..." или «...»
+            m = re.search(r'Номер первой категории\s*[\"“](.*?)[\"”]', t)
+            if m:
+                return m.group(1).strip()
+            m2 = re.search(r'Номер первой категории.*?[«](.*?)[»]', t)
+            if m2:
+                return m2.group(1).strip()
+    except NoSuchElementException:
+        pass
+
+    # 2) fallback: заголовки, но фильтруем мусорные 'ЗАЕЗД/ВЫЕЗД/Количество'
+    for sel in ["h1", "h2", "h3", "h4"]:
+        els = driver.find_elements(By.CSS_SELECTOR, sel)
+        for e in els:
+            txt = (e.text or "").strip()
+            if not txt:
+                continue
+            txt_norm = " ".join(txt.split())
+            txt_upper = txt_norm.upper()
+            if txt_upper in EXCLUDED_TITLE_TOKENS:
+                continue
+            if "ЗАЕЗД" in txt_upper or "ВЫЕЗД" in txt_upper or "КОЛИЧЕСТВО" in txt_upper:
+                continue
+            # Категории обычно длиннее, чем служебные подписи.
+            if len(txt_norm) >= 3:
+                return txt_norm
+
     return None
 
 
@@ -149,18 +201,12 @@ def extract_categories_from_category_pages(driver: webdriver.Chrome, preferred_g
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
         body_text = driver.find_element(By.TAG_NAME, "body").text
-        title = extract_category_title(body_text)
+
+        # Сначала надежно пытаемся извлечь название из DOM по ключевой фразе.
+        title = get_category_title_from_dom(driver)
         if not title:
-            # fallback: по заголовкам
-            for sel in ["h1", "h2", "h3", "h4"]:
-                try:
-                    el = driver.find_element(By.CSS_SELECTOR, sel)
-                    t = el.text.strip()
-                    if t:
-                        title = t
-                        break
-                except NoSuchElementException:
-                    pass
+            # fallback: по тексту страницы (старый метод)
+            title = extract_category_title(body_text)
 
         base_price = parse_base_price_for_guest(body_text, preferred_guest=preferred_guest)
 
@@ -422,6 +468,11 @@ def main() -> None:
         df = pd.DataFrame(rows, columns=["Дата", "Категория номера", "Стоимость (руб)", "Примечание"])
         out_name = f"prices_meridian_{START_DATE}_{END_DATE}.xlsx"
         out_path = out_name  # сохраняем в текущую папку запуска/репозиторий Cursor
+        # pandas для .xlsx требует openpyxl (если не указан другой engine)
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            raise SystemExit("Ошибка: не установлен модуль `openpyxl`. Установите: pip install openpyxl")
 
         df.to_excel(out_path, index=False)
         print(f"\nГотово. Excel сохранен: {out_path}")
