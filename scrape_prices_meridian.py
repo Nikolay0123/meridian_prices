@@ -115,12 +115,16 @@ def get_category_title_from_dom(driver: webdriver.Chrome) -> Optional[str]:
         t = (el.text or "").strip()
         if t:
             # Варианты кавычек: "..." или «...»
-            m = re.search(r'Номер первой категории\s*[\"“](.*?)[\"”]', t)
+            m = re.search(r'Номер первой категории\s*[\"“”](.*?)[\"“”]', t)
             if m:
                 return m.group(1).strip()
             m2 = re.search(r'Номер первой категории.*?[«](.*?)[»]', t)
             if m2:
                 return m2.group(1).strip()
+            # На случай одинарных кавычек
+            m3 = re.search(r"Номер первой категории\s*['‘](.*?)[’']", t)
+            if m3:
+                return m3.group(1).strip()
     except NoSuchElementException:
         pass
 
@@ -176,6 +180,15 @@ def parse_base_price_for_guest(body_text: str, preferred_guest: int = 1) -> Opti
     for guest_str, price_str in exact_pat.findall(text):
         if int(guest_str) == preferred_guest:
             return int(price_str.replace(" ", ""))
+
+    # Если не нашли для preferred_guest, пробуем взять "N гостей ... цена"
+    # (частая ситуация: для категории задана цена только для 5 гостей).
+    guest_any_pat = re.compile(
+        r"(\d+)\s*гост[а-я]*[^0-9]*([\d][\d\s]*)\s*руб",
+        flags=re.IGNORECASE,
+    )
+    for _guest_str, price_str in guest_any_pat.findall(text):
+        return int(price_str.replace(" ", ""))
 
     # Если не нашли для preferred_guest — берем первую сумму рядом с рублями.
     any_pat = re.compile(r"([\d][\d\s]*)\s*руб", flags=re.IGNORECASE)
