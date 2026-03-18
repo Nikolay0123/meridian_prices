@@ -51,7 +51,10 @@ EXCLUDED_TITLE_TOKENS = {
 }
 
 # Дополнительные отели: название, URL или шаблон, кнопка для клика (если нужна).
+# cookie_button: нажать перед основной кнопкой при согласии на cookie.
 # url_template: для подстановки дат используйте {dfrom} и {dto} в формате ДД-ММ-ГГГГ.
+# button_in_iframe: искать кнопку внутри iframe (например Tilda).
+# wait_seconds: дополнительная задержка после загрузки (для SPA).
 HOTEL_SOURCES = [
     {
         "name": "Олимпийская",
@@ -68,17 +71,20 @@ HOTEL_SOURCES = [
         "type": "button",
         "url": "https://www.freezone.net/hotel/",
         "button": "найти номер",
+        "cookie_button": "согласен",
     },
     {
         "name": "Постоялый двор Русь",
         "type": "direct",
         "url": "https://booking-russ.otelms.com/booking/rooms",
+        "wait_seconds": 6,
     },
     {
         "name": "Чехов API",
         "type": "date_button",
         "url_template": "https://chekhov-api.tilda.ws/booking?dfrom={dfrom}&dto={dto}&adults=1&padding=12&lang=ru&uid=53b6c90b-227a-48cf-8339-c85954fab29e",
         "button": "подобрать номер",
+        "button_in_iframe": True,
     },
     {
         "name": "Чеховский мини-отель",
@@ -230,6 +236,52 @@ def click_button_by_text(driver: webdriver.Chrome, button_text: str, wait_after_
     return False
 
 
+def accept_cookie_if_present(driver: webdriver.Chrome, text: str = "согласен", wait_after_s: float = 1.0) -> bool:
+    """
+    Если на странице есть кнопка/ссылка согласия на cookie (например «Согласен»), нажимаем её.
+    """
+    if not text or not text.strip():
+        return False
+    t = text.strip().replace("'", " ")
+    for xpath in [
+        f"//a[contains(., '{t}')]",
+        f"//button[contains(., '{t}')]",
+        f"//*[@type='button'][contains(., '{t}')]",
+        f"//*[contains(., 'cookie') and contains(., '{t[:10]}')]",
+        f"//*[contains(., 'Cookie') and contains(., '{t[:10]}')]",
+    ]:
+        try:
+            els = driver.find_elements(By.XPATH, xpath)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    try:
+                        el.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", el)
+                    human_sleep(wait_after_s, wait_after_s + 0.5)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def click_button_in_iframe_then_page(driver: webdriver.Chrome, button_text: str, wait_after_s: float = 3.0) -> bool:
+    """
+    Сначала ищем кнопку во всех iframe (например виджет Tilda), затем на основной странице.
+    """
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    for ifr in iframes:
+        try:
+            driver.switch_to.frame(ifr)
+            if click_button_by_text(driver, button_text, wait_after_s=wait_after_s):
+                driver.switch_to.default_content()
+                return True
+        except Exception:
+            pass
+        driver.switch_to.default_content()
+    return click_button_by_text(driver, button_text, wait_after_s=wait_after_s)
+
+
 def scrape_prices_generic(driver: webdriver.Chrome) -> list:
     """
     Универсальный сбор категорий и цен со страницы (та же логика, что у Meridian).
@@ -241,25 +293,71 @@ def scrape_prices_generic(driver: webdriver.Chrome) -> list:
 def scrape_one_category_per_page(driver: webdriver.Chrome) -> Optional[dict]:
     """
     Одна страница — одна категория (например Олимпийская: каждая ссылка id=2,14,7,18 — отдельная категория).
-    Извлекаем название (h1/h2) и цену (руб).
+    Сначала ищем блок, в котором есть цена (руб), затем в этом блоке — название категории (заголовок или первая строка).
     """
     try:
-        body = driver.find_element(By.TAG_NAME, "body").text or ""
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
     except NoSuchElementException:
         return None
-    price = to_int_rub(body)
+    price = to_int_rub(body_text)
     if price is None:
         return None
+
     name = None
-    for sel in ["h1", "h2", "h3"]:
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            t = (el.text or "").strip()
-            if t and len(t) > 2 and t.upper() not in EXCLUDED_TITLE_TOKENS:
-                name = t
+    # Ищем элемент с ценой (руб), поднимаемся к контейнеру и в нём ищем заголовок/название категории
+    try:
+        price_els = driver.find_elements(
+            By.XPATH,
+            "//*[contains(., 'руб') or contains(., '₽')]",
+        )
+        for el in price_els:
+            txt = (el.text or "").strip()
+            if to_int_rub(txt) != price:
+                continue
+            # Контейнер: div, section, article, main
+            for tag in ["div", "section", "article", "main"]:
+                try:
+                    block = el.find_element(By.XPATH, f"./ancestor::{tag}[1]")
+                    block_text = (block.text or "").strip()
+                    if not block_text or "руб" not in block_text.lower():
+                        continue
+                    # В блоке ищем заголовок (h1, h2, h3) или первую осмысленную строку
+                    for sel in ["h1", "h2", "h3", "h4"]:
+                        try:
+                            h = block.find_element(By.CSS_SELECTOR, sel)
+                            t = (h.text or "").strip()
+                            if t and len(t) >= 2 and t.upper() not in EXCLUDED_TITLE_TOKENS and "руб" not in t.lower():
+                                name = t
+                                break
+                        except NoSuchElementException:
+                            continue
+                    if name:
+                        break
+                    name = extract_room_name_from_block_text(block_text)
+                    if name:
+                        break
+                except NoSuchElementException:
+                    continue
+            if name:
                 break
-        except NoSuchElementException:
-            continue
+    except Exception:
+        pass
+
+    # Fallback: заголовки страницы по порядку (часто первый — логотип, второй — категория)
+    if not name:
+        for sel in ["h2", "h3", "h1", "h4"]:
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in els:
+                    t = (el.text or "").strip()
+                    if t and len(t) >= 2 and t.upper() not in EXCLUDED_TITLE_TOKENS and "руб" not in t.lower():
+                        name = t
+                        break
+            except NoSuchElementException:
+                continue
+            if name:
+                break
+
     if not name:
         name = "Номер"
     return {"category_name": name, "price": price}
@@ -783,8 +881,13 @@ def main() -> None:
                     print(f"\n[{hotel_name}] {date_in} -> {url[:80]}...")
                     driver.get(url)
                     human_sleep(1.5, 2.5)
-                    if hotel.get("button") and not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
-                        print(f"  Кнопка «{hotel['button']}» не найдена.")
+                    if hotel.get("button"):
+                        if hotel.get("button_in_iframe"):
+                            if not click_button_in_iframe_then_page(driver, hotel["button"], wait_after_s=3.0):
+                                print(f"  Кнопка «{hotel['button']}» не найдена (в т.ч. в iframe).")
+                        else:
+                            if not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
+                                print(f"  Кнопка «{hotel['button']}» не найдена.")
                     scraped = scrape_prices_generic(driver)
                     for item in scraped:
                         rows.append(
@@ -801,6 +904,9 @@ def main() -> None:
                     print(f"\n[{hotel_name}] {date_in} -> {hotel['url']}")
                     driver.get(hotel["url"])
                     human_sleep(1.5, 2.5)
+                    if hotel.get("cookie_button"):
+                        if accept_cookie_if_present(driver, hotel["cookie_button"], wait_after_s=1.0):
+                            human_sleep(0.8, 1.5)
                     if not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
                         print(f"  Кнопка «{hotel['button']}» не найдена.")
                     scraped = scrape_prices_generic(driver)
@@ -816,10 +922,20 @@ def main() -> None:
                         )
                     human_sleep(1.0, 2.0)
                 else:
-                    # direct
+                    # direct (в т.ч. Постоялый двор Русь — даём время на загрузку SPA)
                     print(f"\n[{hotel_name}] {date_in} -> {hotel['url']}")
                     driver.get(hotel["url"])
-                    human_sleep(1.5, 2.5)
+                    extra_wait = hotel.get("wait_seconds") or 1.5
+                    human_sleep(extra_wait, extra_wait + 1.5)
+                    # Ждём появления цен на странице (для otelms и других SPA)
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            lambda d: "руб" in ((d.find_element(By.TAG_NAME, "body").text) or "").lower()
+                            or "₽" in (d.find_element(By.TAG_NAME, "body").text or "")
+                        )
+                    except (TimeoutException, NoSuchElementException):
+                        pass
+                    human_sleep(1.0, 2.0)
                     scraped = scrape_prices_generic(driver)
                     for item in scraped:
                         rows.append(
