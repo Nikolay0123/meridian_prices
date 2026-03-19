@@ -71,6 +71,7 @@ HOTEL_SOURCES = [
         "type": "button",
         "url": "https://www.freezone.net/hotel/",
         "button": "найти номер",
+        "button_alt": ["Забронировать", "найти", "поиск", "Проверить наличие", "check availability"],
         "cookie_button": "согласен",
     },
     {
@@ -84,7 +85,10 @@ HOTEL_SOURCES = [
         "type": "date_button",
         "url_template": "https://chekhov-api.tilda.ws/booking?dfrom={dfrom}&dto={dto}&adults=1&padding=12&lang=ru&uid=53b6c90b-227a-48cf-8339-c85954fab29e",
         "button": "подобрать номер",
+        "button_alt": ["Подобрать номер", "подобрать", "найти номер", "поиск номеров", "Проверить наличие", "Search", "Найти"],
         "button_in_iframe": True,
+        "iframe_wait_seconds": 8,
+        "cookie_button": "OK",
     },
     {
         "name": "Чеховский мини-отель",
@@ -127,16 +131,16 @@ def to_int_rub(text: str) -> Optional[int]:
         return None
 
     # Схватим первое число и (опционально) дробную часть.
-    # Учитываем пробелы в тысячах и запятую в дробной части.
-    m = re.search(r"(\d[\d\s]*)([.,]\d+)?\s*(?:руб|₽|рублей)", text, flags=re.IGNORECASE)
+    # Учитываем пробелы/запятые в тысячах (34,000.00 или 34 000) и запятую/точку в дробной части.
+    m = re.search(r"(\d[\d\s,]*)([.,]\d+)?\s*(?:руб|₽|рублей|RUB)", text, flags=re.IGNORECASE)
     if not m:
-        # Если "руб" рядом нет, попробуем просто числа.
-        m2 = re.search(r"(\d[\d\s]*)([.,]\d+)?", text)
+        # Если "руб"/RUB рядом нет, попробуем просто числа.
+        m2 = re.search(r"(\d[\d\s,]*)([.,]\d+)?", text)
         if not m2:
             return None
         m = m2
 
-    int_part = m.group(1).replace(" ", "")
+    int_part = m.group(1).replace(" ", "").replace(",", "")
     dec_part = m.group(2) or ""
 
     if dec_part:
@@ -218,13 +222,21 @@ def click_button_by_text(driver: webdriver.Chrome, button_text: str, wait_after_
     for xpath in [
         f"//a[contains(., '{t[:50]}')]",
         f"//button[contains(., '{t[:50]}')]",
+        f"//*[@role='button'][contains(., '{t[:50]}')]",
         f"//*[@type='submit'][contains(@value, '{t[:30]}')]",
+        f"//*[@type='button'][contains(@value, '{t[:30]}')]",
+        f"//input[@type='submit' and contains(@value, '{t[:30]}')]",
         f"//*[contains(., '{t[:30]}')]",
     ]:
         try:
             els = driver.find_elements(By.XPATH, xpath)
             for el in els:
                 if el.is_displayed() and el.is_enabled():
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        human_sleep(0.2, 0.4)
+                    except Exception:
+                        pass
                     try:
                         el.click()
                     except Exception:
@@ -265,21 +277,38 @@ def accept_cookie_if_present(driver: webdriver.Chrome, text: str = "соглас
     return False
 
 
-def click_button_in_iframe_then_page(driver: webdriver.Chrome, button_text: str, wait_after_s: float = 3.0) -> bool:
+def click_button_in_iframe_then_page(
+    driver: webdriver.Chrome,
+    button_text: str,
+    wait_after_s: float = 3.0,
+    button_alt: Optional[list] = None,
+    iframe_wait_seconds: float = 4.0,
+) -> bool:
     """
-    Сначала ищем кнопку во всех iframe (например виджет Tilda), затем на основной странице.
+    Сначала ждём загрузки iframe, ищем кнопку во всех iframe (виджет Tilda/Bnovo), затем на основной странице.
+    button_alt — список альтернативных текстов кнопки для перебора.
     """
+    human_sleep(iframe_wait_seconds, iframe_wait_seconds + 1.0)
+    texts_to_try = [button_text]
+    if button_alt:
+        texts_to_try = [button_text] + [t for t in button_alt if t and t != button_text]
+
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     for ifr in iframes:
         try:
             driver.switch_to.frame(ifr)
-            if click_button_by_text(driver, button_text, wait_after_s=wait_after_s):
-                driver.switch_to.default_content()
-                return True
+            for txt in texts_to_try:
+                if click_button_by_text(driver, txt, wait_after_s=wait_after_s):
+                    driver.switch_to.default_content()
+                    return True
         except Exception:
             pass
         driver.switch_to.default_content()
-    return click_button_by_text(driver, button_text, wait_after_s=wait_after_s)
+
+    for txt in texts_to_try:
+        if click_button_by_text(driver, txt, wait_after_s=wait_after_s):
+            return True
+    return False
 
 
 def scrape_prices_generic(driver: webdriver.Chrome) -> list:
@@ -378,7 +407,7 @@ def extract_room_name_from_block_text(block_text: str) -> Optional[str]:
             continue
         if "ЗАЕЗД" in upper or "ВЫЕЗД" in upper or "КОЛИЧЕСТВО" in upper:
             continue
-        if "РУБ" in upper or "₽" in ln:
+        if "РУБ" in upper or "RUB" in ln.upper() or "₽" in ln:
             continue
         # отсечем слишком короткое
         if len(ln) < 3:
@@ -404,10 +433,11 @@ def scrape_prices_from_booking_page(driver: webdriver.Chrome) -> list:
     except NoSuchElementException:
         return []
 
-    # Ищем элементы с ценой (листовые, чтобы отсечь крупные контейнеры)
+    # Ищем элементы с ценой (листовые, чтобы отсечь крупные контейнеры).
+    # Учитываем руб/₽ (кириллица) и RUB (латиница, например OtelMS).
     price_els = driver.find_elements(
         By.XPATH,
-        "//*[not(*) and (contains(translate(., 'РУБЛЕЙРУБ', 'рублейруб'), 'руб') or contains(., '₽'))]",
+        "//*[not(*) and (contains(translate(., 'РУБЛЕЙРУБ', 'рублейруб'), 'руб') or contains(., '₽') or contains(., 'RUB'))]",
     )
 
     results = {}
@@ -715,12 +745,12 @@ def try_extract_exact_price_from_booking_page(driver: webdriver.Chrome) -> Optio
     except NoSuchElementException:
         return None
 
-    # Ищем подстроку вида "xxxx руб"
-    m = re.search(r"(\d[\d\s]*)([.,]\d+)?\s*(руб|₽|рублей)", body_text, flags=re.IGNORECASE)
+    # Ищем подстроку вида "xxxx руб" или "34,000.00 RUB"
+    m = re.search(r"(\d[\d\s,]*)([.,]\d+)?\s*(руб|₽|рублей|RUB)", body_text, flags=re.IGNORECASE)
     if not m:
         return None
 
-    int_part = m.group(1).replace(" ", "")
+    int_part = m.group(1).replace(" ", "").replace(",", "")
     dec_part = m.group(2) or ""
     if dec_part:
         val = float(int_part + dec_part.replace(",", "."))
@@ -881,13 +911,26 @@ def main() -> None:
                     print(f"\n[{hotel_name}] {date_in} -> {url[:80]}...")
                     driver.get(url)
                     human_sleep(1.5, 2.5)
+                    if hotel.get("cookie_button"):
+                        if accept_cookie_if_present(driver, hotel["cookie_button"], wait_after_s=1.0):
+                            human_sleep(0.8, 1.5)
                     if hotel.get("button"):
                         if hotel.get("button_in_iframe"):
-                            if not click_button_in_iframe_then_page(driver, hotel["button"], wait_after_s=3.0):
+                            if not click_button_in_iframe_then_page(
+                                driver,
+                                hotel["button"],
+                                wait_after_s=3.0,
+                                button_alt=hotel.get("button_alt"),
+                                iframe_wait_seconds=hotel.get("iframe_wait_seconds", 5),
+                            ):
                                 print(f"  Кнопка «{hotel['button']}» не найдена (в т.ч. в iframe).")
                         else:
                             if not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
-                                print(f"  Кнопка «{hotel['button']}» не найдена.")
+                                for alt in hotel.get("button_alt") or []:
+                                    if click_button_by_text(driver, alt, wait_after_s=3.0):
+                                        break
+                                else:
+                                    print(f"  Кнопка «{hotel['button']}» не найдена.")
                     scraped = scrape_prices_generic(driver)
                     for item in scraped:
                         rows.append(
@@ -907,7 +950,22 @@ def main() -> None:
                     if hotel.get("cookie_button"):
                         if accept_cookie_if_present(driver, hotel["cookie_button"], wait_after_s=1.0):
                             human_sleep(0.8, 1.5)
-                    if not click_button_by_text(driver, hotel["button"], wait_after_s=3.0):
+                    clicked = click_button_by_text(driver, hotel["button"], wait_after_s=3.0)
+                    if not clicked:
+                        for alt in hotel.get("button_alt") or []:
+                            if click_button_by_text(driver, alt, wait_after_s=3.0):
+                                clicked = True
+                                break
+                    if not clicked:
+                        # виджет бронирования может быть в iframe (например Freezone)
+                        clicked = click_button_in_iframe_then_page(
+                            driver,
+                            hotel["button"],
+                            wait_after_s=3.0,
+                            button_alt=hotel.get("button_alt"),
+                            iframe_wait_seconds=4,
+                        )
+                    if not clicked:
                         print(f"  Кнопка «{hotel['button']}» не найдена.")
                     scraped = scrape_prices_generic(driver)
                     for item in scraped:
@@ -932,6 +990,7 @@ def main() -> None:
                         WebDriverWait(driver, 15).until(
                             lambda d: "руб" in ((d.find_element(By.TAG_NAME, "body").text) or "").lower()
                             or "₽" in (d.find_element(By.TAG_NAME, "body").text or "")
+                            or "RUB" in (d.find_element(By.TAG_NAME, "body").text or "")
                         )
                     except (TimeoutException, NoSuchElementException):
                         pass
