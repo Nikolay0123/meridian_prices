@@ -311,12 +311,123 @@ def click_button_in_iframe_then_page(
     return False
 
 
+def scrape_prices_from_body_text(driver: webdriver.Chrome) -> list:
+    """
+    Фолбэк для страниц, где цены не находятся стандартными селекторами.
+    Ищем строки в `body.text`, где встречается валюта, парсим цену и
+    пытаемся взять название из ближайшей строки выше.
+    """
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+    except NoSuchElementException:
+        body_text = ""
+
+    lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
+    if not lines:
+        return []
+
+    results = []
+    seen_categories = set()
+
+    def has_currency(s: str) -> bool:
+        s_low = (s or "").lower()
+        return ("руб" in s_low) or ("₽" in s_low) or ("RUB" in (s or "").upper())
+
+    for i, ln in enumerate(lines):
+        if not has_currency(ln):
+            continue
+        price = to_int_rub(ln)
+        if price is None:
+            continue
+
+        cat = None
+        # Ищем ближайшую "категорию" в предыдущих 5 строках.
+        for j in range(max(0, i - 5), i):
+            prev = lines[j]
+            if has_currency(prev):
+                continue
+            if "номер" in prev.lower():
+                cat = prev
+                break
+
+        if not cat:
+            # Если нет "Номер", берём предыдущую строку (или запасной вариант).
+            cat = lines[i - 1] if i > 0 else "Номер"
+
+        if cat in seen_categories:
+            continue
+        seen_categories.add(cat)
+        results.append({"category_name": cat, "price": price})
+
+    return results
+
+
+def scrape_prices_from_page_source_html(driver: webdriver.Chrome) -> list:
+    """
+    Экстренный фолбэк: достаём цены прямо из page_source (после удаления тегов).
+    Используется, когда body.text не отдаёт нужный текст.
+    """
+    html = driver.page_source or ""
+    if not html:
+        return []
+
+    # Удаляем теги, чтобы цена/валюта оказались рядом в "plain" тексте.
+    plain = re.sub(r"<[^>]+>", " ", html)
+    plain = " ".join(plain.split())
+
+    # Пытаемся вытащить все суммы с валютой.
+    price_pat = re.compile(r"(\d[\d\s,]*)([.,]\d+)?\s*(руб|₽|рублей|RUB)", flags=re.IGNORECASE)
+
+    results = []
+    seen_prices = set()
+    for m in price_pat.finditer(plain):
+        chunk = m.group(0)
+        price = to_int_rub(chunk)
+        if price is None or price in seen_prices:
+            continue
+        seen_prices.add(price)
+        results.append({"category_name": "Номер", "price": price})
+
+    return results
+
+
 def scrape_prices_generic(driver: webdriver.Chrome) -> list:
     """
     Универсальный сбор категорий и цен со страницы (та же логика, что у Meridian).
     Возвращает список {"category_name": str, "price": int}.
     """
-    return scrape_prices_from_booking_page(driver)
+    # 1) Пробуем собрать цены в текущем (основном) DOM.
+    results = scrape_prices_from_booking_page(driver)
+    if results:
+        return results
+
+    # 2) Иногда виджет бронирования (Bnovo/OtelMS) рендерит цены в iframe.
+    #    Тогда в основном DOM может не быть ни "руб", ни "₽", ни "RUB".
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    for iframe in iframes:
+        try:
+            driver.switch_to.frame(iframe)
+            iframe_results = scrape_prices_from_booking_page(driver)
+            if iframe_results:
+                return iframe_results
+        except Exception:
+            pass
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+    # 3) Последние фолбэки: извлекаем цены напрямую.
+    body_results = scrape_prices_from_body_text(driver)
+    if body_results:
+        return body_results
+
+    page_source_results = scrape_prices_from_page_source_html(driver)
+    if page_source_results:
+        return page_source_results
+
+    return results
 
 
 def scrape_one_category_per_page(driver: webdriver.Chrome) -> Optional[dict]:
@@ -433,16 +544,23 @@ def scrape_prices_from_booking_page(driver: webdriver.Chrome) -> list:
     except NoSuchElementException:
         return []
 
-    # Ищем элементы с ценой (листовые, чтобы отсечь крупные контейнеры).
+    # Ищем элементы с ценой.
+    # На OtelMS цена лежит внутри `span` с дочерними элементами (например help-icon),
+    # поэтому ограничение `not(*)` ломает извлечение (элемент не становится "leaf node").
     # Учитываем руб/₽ (кириллица) и RUB (латиница, например OtelMS).
     price_els = driver.find_elements(
         By.XPATH,
-        "//*[not(*) and (contains(translate(., 'РУБЛЕЙРУБ', 'рублейруб'), 'руб') or contains(., '₽') or contains(., 'RUB'))]",
+        # normalize case for Cyrillic "РУБ" -> "руб"
+        "//*[not(self::script) and not(self::style) and (contains(translate(., 'РУБ', 'руб'), 'руб') or contains(., '₽') or contains(., 'RUB'))]",
     )
 
     results = {}
     for el in price_els:
         txt = (el.text or "").strip()
+        # Сильно ограничим мусор: если нет цифр рядом с валютой — to_int_rub вернет None,
+        # но это уже фильтрация на раннем этапе (ускоряет и повышает стабильность).
+        if not txt or not any(ch.isdigit() for ch in txt):
+            continue
         price = to_int_rub(txt)
         if price is None:
             continue
